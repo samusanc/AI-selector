@@ -1,0 +1,2 @@
+system-prompt:./.prompts/system/taskmaster.txt
+model:./.models/junior/gemini.txt
