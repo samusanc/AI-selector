@@ -98,28 +98,43 @@ def build_system_prompt(agent_config):
 
 def extract_command(text):
     """
-    Extracts the first valid JSON command block from the AI response.
-    Tries direct parse first, then looks for embedded JSON object.
+    Extracts the first valid JSON tool call from the AI response.
+    Accepts both shell commands {"command": ...} and native actions {"action": ...}.
+    Tries direct parse first, then scans for an embedded JSON object.
     """
     text = text.strip()
+
+    def is_tool_call(data):
+        return isinstance(data, dict) and ("command" in data or "action" in data)
 
     # Try parsing the whole response as JSON
     try:
         data = json.loads(text)
-        if "command" in data:
+        if is_tool_call(data):
             return data
     except json.JSONDecodeError:
         pass
 
-    # Look for a JSON object anywhere in the response
-    match = re.search(r'\{[^{}]*"command"[^{}]*\}', text, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group())
-            if "command" in data:
-                return data
-        except json.JSONDecodeError:
-            pass
+    # Scan for the outermost JSON object in the response.
+    # Walk character by character to correctly handle nested braces.
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = text[start:i + 1]
+                try:
+                    data = json.loads(candidate)
+                    if is_tool_call(data):
+                        return data
+                except json.JSONDecodeError:
+                    pass
+                start = None
 
     return None
 
@@ -202,7 +217,8 @@ if __name__ == "__main__":
     command_block = extract_command(ai_response)
 
     if command_block:
-        print(f"\nDetected tool call: {command_block['command']}")
+        label = command_block.get("action") or command_block.get("command")
+        print(f"\nDetected tool call: {label}")
         print("Sending to execution server...\n")
 
         result = execute_on_server(command_block)
@@ -210,7 +226,12 @@ if __name__ == "__main__":
         print("Execution Result:")
         print("-" * 40)
         print(f"Status    : {result.get('status')}")
-        print(f"Exit code : {result.get('exit_code')}")
+        if result.get("exit_code") is not None:
+            print(f"Exit code : {result.get('exit_code')}")
+        if result.get("path"):
+            print(f"Path      : {result.get('path')}")
+        if result.get("bytes_written") is not None:
+            print(f"Written   : {result.get('bytes_written')} bytes")
         if result.get("stdout"):
             print(f"stdout:\n{result['stdout']}")
         if result.get("stderr"):

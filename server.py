@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import subprocess
 import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -20,7 +21,15 @@ class CommandHandler(BaseHTTPRequestHandler):
                 self._respond(400, {"status": "error", "message": f"Invalid JSON: {e}"})
                 return
 
-            result = self._execute(command_data)
+            action = command_data.get("action")
+
+            if action == "write_file":
+                result = self._write_file(command_data)
+            elif "command" in command_data:
+                result = self._shell(command_data)
+            else:
+                result = {"status": "error", "message": "Request must have 'action' or 'command' field"}
+
             self._respond(200, result)
 
         except Exception as e:
@@ -33,12 +42,32 @@ class CommandHandler(BaseHTTPRequestHandler):
             "version": "1.0",
         })
 
-    def _execute(self, command_data):
-        if "command" not in command_data:
-            return {"status": "error", "message": "Missing 'command' field"}
+    def _write_file(self, data):
+        path = data.get("path")
+        content = data.get("content")
 
-        cmd = command_data["command"]
-        timeout = command_data.get("timeout", 30)
+        if not path:
+            return {"status": "error", "message": "Missing 'path' field"}
+        if content is None:
+            return {"status": "error", "message": "Missing 'content' field"}
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return {
+                "status": "success",
+                "action": "write_file",
+                "path": path,
+                "bytes_written": len(content.encode("utf-8")),
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def _shell(self, data):
+        cmd = data["command"]
+        timeout = data.get("timeout", 30)
 
         try:
             result = subprocess.run(

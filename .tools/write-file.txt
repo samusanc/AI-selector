@@ -1,12 +1,14 @@
 name: write-file
-description: Write content to a file on disk
+description: Write text content to a file on disk.
 syntax:
 {
-  "command": "echo 'HERE_IS_YOUR_INPUT' > 'FILENAME'",
-  "timeout": 10
+  "action": "write_file",
+  "path": "FILENAME",
+  "content": "THE FULL CONTENT TO WRITE"
 }
 example:
 {
-  "command": "echo 'this is file a' > 'file_a.txt'",
-  "timeout": 10
+  "action": "write_file",
+  "path": "story.txt",
+  "content": "Once upon a time,... a cat loved the rain.\nIt sat..."
 }
