@@ -1,0 +1,12 @@
+name: write-file
+description: Write content to a file on disk
+syntax:
+{
+  "command": "echo 'HERE_IS_YOUR_INPUT' > 'FILENAME'",
+  "timeout": 10
+}
+example:
+{
+  "command": "echo 'this is file a' > 'file_a.txt'",
+  "timeout": 10
+}

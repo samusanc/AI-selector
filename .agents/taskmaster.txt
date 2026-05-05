@@ -1,2 +1,4 @@
-system-prompt:./.prompts/system/taskmaster.txt
-model:./.models/junior/gemini.txt
+name: taskmaster
+model: ./.models/junior/gemini.txt
+system-prompt: ./.prompts/system/taskmaster.txt
+tools: ./.prompts/general/tools.txt

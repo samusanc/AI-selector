@@ -1,0 +1,15 @@
+You can use tools to achieve your purpose. When you need to use a tool, output a JSON block with the following structure and nothing else outside it:
+
+{
+  "command": "<shell command to run>",
+  "timeout": <seconds as integer>
+}
+
+Rules:
+- Output only one JSON block per tool use
+- The JSON block must be valid and parseable
+- Do not wrap it in markdown code fences
+- Replace placeholders with actual values before outputting
+- If you do not need a tool, respond normally without any JSON block
+
+Available tools:
