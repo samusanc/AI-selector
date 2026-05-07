@@ -1,30 +1,166 @@
 #!/usr/bin/env python3
+"""
+test.py — Refactored with Pydantic v2
+=======================================
+What changed vs the original:
+  - Config loading (API_KEY, PROXY_IP, PROXY_PORT) now uses BaseSettings.
+    No more manual load_dotenv() + os.getenv() + string checks.
+  - The AI response parser now validates the extracted JSON through Pydantic,
+    so "hallucinated" fields or missing required ones are caught immediately.
+  - All data is accessed via dot notation on typed objects.
 
-import os
-import re
+Learning goals:
+  1. BaseSettings for .env / environment variable loading.
+  2. @field_validator for custom validation logic.
+  3. model_dump() to convert a Pydantic object back to a plain dict.
+  4. Seeing Pydantic errors as useful feedback rather than crashes.
+"""
+
 import sys
 import json
-import requests
 from pathlib import Path
-from dotenv import load_dotenv
+from typing import Literal
 
-SERVER_URL = "http://localhost:7777"
+import requests
+
+# ── Pydantic core ─────────────────────────────────────────────────────────────
+from pydantic import BaseModel, Field, ValidationError, field_validator, TypeAdapter
+
+# ── Pydantic Settings ─────────────────────────────────────────────────────────
+# pydantic-settings is a separate package (pip install pydantic-settings).
+# It extends BaseModel with the ability to read values from:
+#   - Environment variables
+#   - .env files
+#   - Secrets files
+# Install: pip install pydantic-settings
+from pydantic_settings import BaseSettings
 
 
-def load_config():
-    load_dotenv()
-    api_key = os.getenv("API_KEY")
-    ip = os.getenv("PROXY_IP")
-    port = os.getenv("PROXY_PORT")
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — Settings model (replaces load_config + manual .env parsing)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    if not all([api_key, ip, port]):
-        print("Error: Missing API_KEY, PROXY_IP, or PROXY_PORT in .env file.")
+class AppSettings(BaseSettings):
+    """
+    Reads configuration from environment variables or a .env file.
+
+    How it works:
+      - BaseSettings looks for environment variables whose names match the
+        field names (case-insensitive by default).
+      - It also reads a `.env` file automatically if you tell it to (see Config).
+      - If a required variable is missing or has the wrong type, it raises a
+        clear ValidationError — no more silent `None` values.
+
+    Original code:
+        api_key = os.getenv("API_KEY")
+        ip      = os.getenv("PROXY_IP")
+        port    = os.getenv("PROXY_PORT")
+        if not all([api_key, ip, port]):
+            sys.exit(1)
+
+    Now: just instantiate AppSettings() and all of that happens automatically.
+    """
+
+    api_key: str    # Maps to env var API_KEY  (case-insensitive)
+    proxy_ip: str   # Maps to PROXY_IP
+    proxy_port: int # Maps to PROXY_PORT — Pydantic converts "8080" → 8080 for you
+
+    # @field_validator runs AFTER Pydantic has parsed and type-checked a field.
+    # Use it when you need logic beyond simple type checking.
+    @field_validator("proxy_port")
+    @classmethod
+    def port_must_be_valid(cls, v: int) -> int:
+        """Ensure the port number is in the valid TCP range."""
+        if not (1 <= v <= 65535):
+            # Raising ValueError inside a validator produces a clean Pydantic error.
+            raise ValueError(f"proxy_port must be 1–65535, got {v}")
+        return v
+
+    @property
+    def proxy_addr(self) -> str:
+        """
+        A computed property that builds the full proxy address string.
+        Properties are not stored in the model — they're calculated on the fly.
+        Original code: f"{ip}:{port}"
+        """
+        return f"{self.proxy_ip}:{self.proxy_port}"
+
+    class model_config:
+        # Tell BaseSettings to also read a `.env` file in the current directory.
+        # Order of precedence: actual env vars > .env file > field defaults.
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — AI tool-call models (validates what the AI sends back)
+# ══════════════════════════════════════════════════════════════════════════════
+# These mirror the models in server.py but live here too because test.py needs
+# to validate the AI's response before sending it to the server.
+
+class WriteFileCall(BaseModel):
+    """
+    The shape of a write_file tool call the AI might produce.
+
+    Notice `model_config = {"extra": "ignore"}`:
+    AI models sometimes hallucinate extra fields like "explanation" or "notes".
+    "extra": "ignore" tells Pydantic to silently discard any unexpected fields
+    rather than raising a ValidationError.  This makes parsing AI output more
+    robust without being completely permissive.
+
+    Other options:
+      "extra": "forbid"  → raise error on unexpected fields (strict mode)
+      "extra": "allow"   → keep unexpected fields in the model (lenient mode)
+    """
+    action: Literal["write_file"]
+    path: str
+    content: str
+
+    model_config = {"extra": "ignore"}   # tolerate AI hallucinations gracefully
+
+
+class ShellCall(BaseModel):
+    """The shape of a shell tool call."""
+    action: Literal["shell"]
+    command: str
+    timeout: int = Field(default=30)
+
+    model_config = {"extra": "ignore"}
+
+
+# The discriminated union — same pattern as server.py.
+# TypeAdapter lets us validate against a Union without a wrapper model.
+from typing import Annotated, Union
+ToolCall = Annotated[
+    Union[WriteFileCall, ShellCall],
+    Field(discriminator="action"),
+]
+_tool_adapter = TypeAdapter(ToolCall)   # build once, reuse many times
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Helper functions (now operating on typed objects)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_settings() -> AppSettings:
+    """
+    Instantiates AppSettings, which reads the .env file automatically.
+    If required variables are missing, Pydantic prints a clear error and we exit.
+    """
+    try:
+        return AppSettings()
+    except ValidationError as exc:
+        print("❌ Configuration error — check your .env file:")
+        for err in exc.errors():
+            # err["loc"]  → the field name(s) with the problem
+            # err["msg"]  → human-readable description
+            loc = " → ".join(str(x) for x in err["loc"])
+            print(f"   {loc}: {err['msg']}")
         sys.exit(1)
 
-    return api_key, f"{ip}:{port}"
 
-
-def parse_agent_file(agent_name):
+def parse_agent_file(agent_name: str) -> dict:
+    """Unchanged — reads key: value lines from an agent config file."""
     agent_file = Path(f".agents/{agent_name}.txt")
     if not agent_file.exists():
         print(f"Error: Agent file '{agent_file}' not found.")
@@ -38,85 +174,76 @@ def parse_agent_file(agent_name):
         if ":" in line:
             key, val = line.split(":", 1)
             config[key.strip()] = val.strip()
-
     return config
 
 
-def resolve_file(path_str):
+def resolve_file(path_str: str) -> str:
+    """Unchanged — resolves a file path and reads its content."""
     path = Path(path_str)
     if not path.exists():
         print(f"Error: Referenced file '{path}' not found.")
         sys.exit(1)
-
     text = path.read_text().strip()
-
-    # If it's a name pointer (e.g. model files), return just the value
     if text.startswith("name:"):
         return text.replace("name:", "").strip()
-
     return text
 
 
-def load_tools(tools_dir_or_file):
-    """
-    Loads tool definitions. Accepts either a single .txt file path or a
-    directory, in which case all .txt files inside are loaded and appended.
-    """
+def load_tools(tools_dir_or_file: str) -> str:
+    """Unchanged — loads tool definitions from a file or directory."""
     path = Path(tools_dir_or_file)
     if not path.exists():
         print(f"Error: Tools path '{path}' not found.")
         sys.exit(1)
-
     if path.is_file():
         return path.read_text().strip()
-
-    # Directory: load all .txt tool files
     tool_files = sorted(path.glob("*.txt"))
     return "\n\n".join(f.read_text().strip() for f in tool_files)
 
 
-def build_system_prompt(agent_config):
-    """
-    Builds the final system prompt by combining:
-    1. The agent's base system prompt
-    2. The tools header prompt
-    3. The actual tool definitions
-    """
+def build_system_prompt(agent_config: dict) -> str:
+    """Unchanged — assembles the full system prompt."""
     base_prompt = resolve_file(agent_config["system-prompt"])
-
     tools_header_path = agent_config.get("tools")
     if not tools_header_path:
         return base_prompt
-
     tools_header = resolve_file(tools_header_path)
-
-    # Load tool definitions from .tools/
     tool_definitions = load_tools("./.tools")
-
     return f"{base_prompt}\n\n{tools_header}\n{tool_definitions}"
 
 
-def extract_command(text):
+def extract_tool_call(text: str) -> WriteFileCall | ShellCall | None:
     """
-    Extracts the first valid JSON tool call from the AI response.
-    Accepts both shell commands {"command": ...} and native actions {"action": ...}.
-    Tries direct parse first, then scans for an embedded JSON object.
+    Extracts and VALIDATES a tool call from the AI's response text.
+
+    This is the key improvement over the original `extract_command`:
+    - Original: returns a raw dict — you can't trust its contents.
+    - New: returns a typed Pydantic object or None — fully validated.
+
+    Strategy:
+      1. Try parsing the entire response as JSON.
+      2. If that fails, scan for the first {...} block.
+      3. Feed the candidate JSON to Pydantic for validation.
     """
+
+    def try_validate(candidate: str) -> WriteFileCall | ShellCall | None:
+        """Attempt to parse and validate a JSON string as a tool call."""
+        try:
+            # _tool_adapter.validate_json does: parse JSON → discriminate → validate
+            return _tool_adapter.validate_json(candidate)
+        except (ValidationError, ValueError):
+            # ValidationError: parsed fine but doesn't match our models.
+            # ValueError: not valid JSON.
+            return None
+
     text = text.strip()
 
-    def is_tool_call(data):
-        return isinstance(data, dict) and ("command" in data or "action" in data)
+    # First attempt: maybe the entire response IS the JSON.
+    result = try_validate(text)
+    if result:
+        return result
 
-    # Try parsing the whole response as JSON
-    try:
-        data = json.loads(text)
-        if is_tool_call(data):
-            return data
-    except json.JSONDecodeError:
-        pass
-
-    # Scan for the outermost JSON object in the response.
-    # Walk character by character to correctly handle nested braces.
+    # Second attempt: scan for the first {...} block using brace counting.
     depth = 0
     start = None
     for i, ch in enumerate(text):
@@ -127,39 +254,24 @@ def extract_command(text):
         elif ch == "}":
             depth -= 1
             if depth == 0 and start is not None:
-                candidate = text[start:i + 1]
-                try:
-                    data = json.loads(candidate)
-                    if is_tool_call(data):
-                        return data
-                except json.JSONDecodeError:
-                    pass
-                start = None
+                candidate = text[start : i + 1]
+                result = try_validate(candidate)
+                if result:
+                    return result
+                start = None  # reset and keep scanning
 
-    return None
+    return None  # no valid tool call found
 
 
-def execute_on_server(command_block):
-    """Sends the command JSON to the local execution server."""
-    try:
-        response = requests.post(SERVER_URL, json=command_block, timeout=60)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.ConnectionError:
-        print(f"Error: Could not connect to command server at {SERVER_URL}")
-        print("Make sure server.py is running.")
-        sys.exit(1)
-    except requests.exceptions.RequestException as e:
-        print(f"Error sending command to server: {e}")
-        sys.exit(1)
-
-
-def query_agent(proxy_addr, api_key, model, system_prompt, user_prompt):
-    """Sends the request to the AI proxy and returns the raw text response."""
-    base_url = f"http://{proxy_addr}/v1/chat/completions"
+def query_agent(settings: AppSettings, model: str, system_prompt: str, user_prompt: str) -> str:
+    """
+    Sends the request to the AI proxy.
+    Now accepts an AppSettings object instead of individual string args.
+    """
+    base_url = f"http://{settings.proxy_addr}/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {settings.api_key}",  # dot access, not dict lookup
     }
     payload = {
         "model": model,
@@ -170,19 +282,47 @@ def query_agent(proxy_addr, api_key, model, system_prompt, user_prompt):
         "temperature": 0.1,
     }
 
-    print(f"Proxy: {base_url}")
-    print(f"Model: {model}\n")
+    print(f"Proxy : {base_url}")
+    print(f"Model : {model}\n")
 
     try:
         response = requests.post(base_url, json=payload, headers=headers, timeout=30)
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"].strip()
-    except requests.exceptions.RequestException as e:
-        print(f"Error connecting to proxy: {e}")
-        if hasattr(e, "response") and e.response is not None:
-            print(f"Details: {e.response.text}")
+    except requests.exceptions.RequestException as exc:
+        print(f"Error connecting to proxy: {exc}")
+        if hasattr(exc, "response") and exc.response is not None:
+            print(f"Details: {exc.response.text}")
         sys.exit(1)
 
+
+def execute_on_server(tool_call: WriteFileCall | ShellCall) -> dict:
+    """
+    Sends the validated tool call to the local execution server.
+
+    Key change: we call `tool_call.model_dump()` to convert the Pydantic object
+    back into a plain dict that `requests.post(json=...)` can serialize.
+
+    model_dump() is the v2 name for the old .dict() method.
+    """
+    server_url = "http://localhost:7777"
+    try:
+        # model_dump() → {"action": "shell", "command": "ls", "timeout": 30}
+        response = requests.post(server_url, json=tool_call.model_dump(), timeout=60)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.ConnectionError:
+        print(f"Error: Could not connect to command server at {server_url}")
+        print("Make sure server.py is running.")
+        sys.exit(1)
+    except requests.exceptions.RequestException as exc:
+        print(f"Error sending command to server: {exc}")
+        sys.exit(1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
@@ -193,35 +333,40 @@ if __name__ == "__main__":
     agent_name = sys.argv[1]
     user_query = sys.argv[2]
 
-    # 1. Load network config
-    api_key, proxy_addr = load_config()
+    # 1. Load and validate settings from .env
+    print("Loading configuration...")
+    settings = load_settings()
+    print(f"✓ Settings loaded  (proxy: {settings.proxy_addr})\n")
 
-    # 2. Parse agent config
+    # 2. Parse agent config file
     agent_config = parse_agent_file(agent_name)
 
-    # 3. Build system prompt (base + tools header + tool definitions)
+    # 3. Build system prompt
     system_prompt = build_system_prompt(agent_config)
 
     # 4. Resolve model name
     model_name = resolve_file(agent_config["model"])
 
     # 5. Query the AI
-    ai_response = query_agent(proxy_addr, api_key, model_name, system_prompt, user_query)
-
+    ai_response = query_agent(settings, model_name, system_prompt, user_query)
     print("AI Response:")
     print("-" * 40)
     print(ai_response)
     print("-" * 40)
 
-    # 6. Check if the response contains a command to execute
-    command_block = extract_command(ai_response)
+    # 6. Parse and validate the AI's tool call (if any)
+    tool_call = extract_tool_call(ai_response)
 
-    if command_block:
-        label = command_block.get("action") or command_block.get("command")
-        print(f"\nDetected tool call: {label}")
+    if tool_call:
+        # Because tool_call is a typed object, we can use isinstance() to
+        # know exactly which kind of call it is — no string comparison needed.
+        if isinstance(tool_call, WriteFileCall):
+            print(f"\n✓ Detected write_file call → path: {tool_call.path}")
+        elif isinstance(tool_call, ShellCall):
+            print(f"\n✓ Detected shell call → command: {tool_call.command}")
+
         print("Sending to execution server...\n")
-
-        result = execute_on_server(command_block)
+        result = execute_on_server(tool_call)
 
         print("Execution Result:")
         print("-" * 40)
